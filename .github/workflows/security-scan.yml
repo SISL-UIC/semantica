@@ -1,773 +1,483 @@
 name: Security Scan
-
-on:
-  schedule:
-    # Daily, so a newly published advisory against a pinned dependency
-    # fails here on main first, instead of surfacing as a failure on
-    # whichever PR happens to run next.
-    - cron: '30 1 * * *'  # Daily 7 AM IST
-  workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'mkdocs.yml'
-      - 'requirements-docs.txt'
-      - '**/*.md'
-  pull_request:
-    branches: [main]
-
 permissions:
   contents: read
-
 jobs:
-  # Detect whether this PR touches any source files (non-docs/non-markdown).
-  # The result drives the `security-scan` job's `if:` condition so that:
-  #   - docs-only PRs: `security-scan` is skipped (satisfies the required check).
-  #   - code PRs:      the full scan runs exactly as before.
-  # Schedule and workflow_dispatch runs always skip this job and run the scan
-  # unconditionally (the security-scan job's if: accounts for that below).
-  # Push events (to main) keep their own paths-ignore above.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     if: github.event_name == 'pull_request'
     outputs:
       src: ${{ steps.filter.outputs.src }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Check for source changes
-        id: filter
-        run: |
-          # List files changed in this PR relative to the true merge base.
-          # Using three-dot merge-base diff so changes on the base branch that
-          # are not part of this PR do not appear in the file list.
-          # If every changed file matches the docs/markdown paths-ignore list
-          # (at any directory depth), this is a docs-only PR and src=false;
-          # otherwise src=true.
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-          MERGE_BASE=$(git merge-base "$BASE" "$HEAD")
-          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD")
-          echo "Changed files:"
-          echo "$CHANGED"
-          NON_DOCS=$(echo "$CHANGED" | grep -Ev '^(docs/|mkdocs\.yml$|requirements-docs\.txt$|.*\.md$)' || true)
-          if [ -n "$NON_DOCS" ]; then
-            echo "src=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "src=false" >> "$GITHUB_OUTPUT"
-          fi
-
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+    - name: Check for source changes
+      id: filter
+      run: |
+        # List files changed in this PR relative to the true merge base.
+        # Using three-dot merge-base diff so changes on the base branch that
+        # are not part of this PR do not appear in the file list.
+        # If every changed file matches the docs/markdown paths-ignore list
+        # (at any directory depth), this is a docs-only PR and src=false;
+        # otherwise src=true.
+        BASE="${{ github.event.pull_request.base.sha }}"
+        HEAD="${{ github.event.pull_request.head.sha }}"
+        MERGE_BASE=$(git merge-base "$BASE" "$HEAD")
+        CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD")
+        echo "Changed files:"
+        echo "$CHANGED"
+        NON_DOCS=$(echo "$CHANGED" | grep -Ev '^(docs/|mkdocs\.yml$|requirements-docs\.txt$|.*\.md$)' || true)
+        if [ -n "$NON_DOCS" ]; then
+          echo "src=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "src=false" >> "$GITHUB_OUTPUT"
+        fi
+    timeout-minutes: 45
   security-scan:
-    # For pull_request events:
-    #   - skip only when changes ran successfully and explicitly set src=false
-    #     (i.e. a confirmed docs-only PR).
-    #   - run when changes succeeded with src=true (source changes present).
-    #   - run when changes failed or was cancelled (fail-closed: missing output
-    #     must not silently skip the security scan).
-    # For schedule/workflow_dispatch/push: changes is skipped; always() ensures
-    # the scan still runs unconditionally for those triggers.
-    needs: [changes]
-    if: >-
-      always() && (
+    needs:
+    - changes
+    if: |-
+      ${{ !cancelled() && (always() && (
         github.event_name != 'pull_request' ||
         needs.changes.result != 'success' ||
         needs.changes.outputs.src == 'true'
-      )
-    runs-on: ubuntu-latest
+      )) }}
+    runs-on: self-hosted
     permissions:
       contents: read
       security-events: write
       actions: read
-      # Needed for the "Comment PR with Security Results" step below. Safe on
-      # pull_request (not pull_request_target): GitHub always forces a
-      # read-only token for PRs from forks regardless of this permission.
       pull-requests: write
-    # For the report-scheduled-result job, which cannot read this job's
-    # $GITHUB_ENV.
     outputs:
       ignored_vuln_ids: ${{ steps.pip_audit.outputs.ignored_vuln_ids }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-        
-      - name: Install dependencies
-        run: |
-          pip install -r .github/requirements/bootstrap.txt --require-hashes
-          # Install the pinned dependency set FIRST so pip-audit scans
-          # Semantica's exact CI/release dependency tree (requirements-ci.txt
-          # is generated from pyproject.toml extras, so this covers the
-          # project's real deps).
-          pip install -r requirements-ci.txt --require-hashes
-          # Tooling AFTER the pinned set: installing it first would let the
-          # pinned requirements overwrite the tooling's own transitive deps.
-          pip install -r .github/requirements/pip-audit.txt --require-hashes
-          # --no-deps: security-scan-tools.txt overrides semgrep's pyjwt pin
-          # (see security-scan-tools-overrides.txt), which pip's resolver would
-          # otherwise reject. The file already hash-pins every transitive dep.
-          pip install -r .github/requirements/security-scan-tools.txt --require-hashes --no-deps
-
-      - name: Run pip-audit (Package Vulnerabilities)
-        id: pip_audit
-        continue-on-error: true
-        run: |
-          # Keep publishing reports and the PR comment even when the audit
-          # gate fails. The final gate below preserves the failure status.
-          echo 'AUDIT_SCAN_STATUS=failed' >> "$GITHUB_ENV"
-
-          # Same dependency tree Safety used to scan, and the same tool and
-          # invocation already proven reliable in security.yml.
-          #
-          # CI installs TWO locked dependency graphs, so both are audited:
-          # requirements-ci.txt (generated from the `all` extra) and
-          # .github/requirements/open-ontologies-extra.txt, which ci.yml
-          # installs and imports to run the Open Ontologies integration
-          # tests. The open-ontologies extra is deliberately kept out of
-          # `all`, so requirements-ci.txt does not carry it: auditing only
-          # that file would leave a disclosed vulnerability in
-          # open-ontologies-lite, or in any package unique to its
-          # resolution, unable to fail this gate.
-          pip-audit -r requirements-ci.txt --format=json --output=pip-audit-base.json || true
-          pip-audit -r .github/requirements/open-ontologies-extra.txt --format=json --output=pip-audit-open-ontologies.json || true
-
-          # Guard 1: fail loudly if pip-audit exited before writing a report
-          # at all (network error, tool crash). Without this check a missing
-          # or empty file causes jq to fall back to "0", making a broken
-          # scanner indistinguishable from a clean scan. Applied to each raw
-          # report, so one silently failing audit cannot be hidden by the
-          # other one succeeding.
-          for raw_report in pip-audit-base.json pip-audit-open-ontologies.json; do
-            if [ ! -s "$raw_report" ]; then
-              echo "::error::pip-audit produced no report ($raw_report is missing or empty). Treating as failure — check for network errors or pip-audit crashes in the logs above."
-              exit 1
-            fi
-          done
-
-          # Merge into the single pip-audit-report.json that every step below
-          # reads, so the validation, allowlist, counting, reporting and
-          # artifact-upload logic stays exactly as it was.
-          #
-          # Both graphs resolve against the same constraint file and so share
-          # most of their packages. Entries are deduplicated on
-          # (lowercased name, version) and their vulns unioned by id —
-          # without that, one finding in a shared package would be counted
-          # twice by the gate and listed twice in the PR comment. An entry
-          # that pip-audit could audit (it carries a vulns array) is
-          # preferred over the same package reported with a skip_reason, so
-          # merging never downgrades a real result to an unaudited one.
-          # `.[0] + {...}` keeps any other top-level keys pip-audit emits.
-          jq -s '
-            .[0] + {dependencies: (
-              [.[].dependencies[]]
-              # A space cannot occur in a PEP 508 name or a version, so it
-              # is a safe key separator; a \u0000 escape would depend on how
-              # the jq build handles a NUL inside a string.
-              | group_by(((.name // "") | ascii_downcase) + " " + (.version // ""))
-              | map(
-                  (((map(select(has("vulns"))) | first) // .[0])) as $base
-                  | if ($base | has("vulns"))
-                    then $base + {vulns: ([.[].vulns // []] | add | unique_by(.id))}
-                    else $base
-                    end
-                )
-            )}
-          ' pip-audit-base.json pip-audit-open-ontologies.json > pip-audit-report.json
-
-          # Guard 1b: a jq failure above leaves an empty file, which would
-          # read as a clean scan to everything below.
-          if [ ! -s pip-audit-report.json ]; then
-            echo "::error::Merging the pip-audit reports produced no output (pip-audit-report.json is missing or empty). Treating as failure — check the jq invocation above."
-            exit 1
-          fi
-
-          # Guard 2: fail closed when the report doesn't have the shape the
-          # checks below assume: a non-empty dependencies array, each entry
-          # either carrying an array-valued vulns field or being a dependency
-          # pip-audit couldn't resolve/audit, which it reports as
-          # {"name": ..., "skip_reason": ...} with no vulns field at all
-          # (see pip_audit._format.json.JsonFormat._format_dep). That's a
-          # normal, documented report shape, not a malformed one — treating
-          # it as invalid would fail the whole job over a single unauditable
-          # package, the same kind of scan-unrelated CI break this migration
-          # away from Safety was meant to fix.
-          if ! jq -e '
-            (.dependencies | type == "array" and length > 0)
-            and all(.dependencies[]; type == "object" and ((.vulns | type == "array") or (.skip_reason | type == "string")))
-          ' pip-audit-report.json >/dev/null 2>&1; then
-            echo "::error::pip-audit report has an invalid dependency structure. Expected a non-empty dependencies array where every entry has either a vulns array or a skip_reason. Treating as failure."
-            exit 1
-          fi
-
-          echo "Checking for package vulnerabilities..."
-
-          # Guard 2 above already confirmed pip-audit-report.json is valid
-          # JSON with a well-shaped dependencies array, so this count is
-          # always a plain non-negative integer.
-          SKIPPED=$(jq '[.dependencies[] | select(has("skip_reason"))] | length' pip-audit-report.json)
-          if [ "$SKIPPED" -gt 0 ]; then
-            echo "⚠️ pip-audit could not audit $SKIPPED dependencies (see pip-audit-report.json for skip_reason):"
-            jq -r '.dependencies[] | select(has("skip_reason")) | "  - \(.name): \(.skip_reason)"' pip-audit-report.json
-          fi
-
-          # Clearing an advisory: bump the package to the latest release with
-          # no known advisories, not to the first fixed version. #1924 moved
-          # docling only to 2.131.0, the first release fixing one advisory,
-          # and three more advisories against <2.132.0 failed every PR a day
-          # later. Ignoring an ID below is for findings that are reviewed
-          # and genuinely non-actionable, never a way to get CI green.
-          #
-          # Vulnerability IDs accepted for this project. Comma-separated; give
-          # each entry a comment here saying what it covers and when to
-          # re-evaluate it.
-          #   NOTE: pip-audit's OSV-backed report may surface either identifier as
-          #   the primary `id` (with the other listed under `aliases`) depending on
-          #   which alias the backing database picks as canonical, so list both
-          #   the GHSA and the CVE id of an advisory here; the matching below
-          #   checks aliases too - see
-          #   https://github.com/semantica-agi/semantica/actions/runs/34296586683
-          #   where this ignore list had only the GHSA id but the report's `id`
-          #   was the CVE, so the gate still failed.
-          # None accepted at the moment.
-          IGNORED_VULN_IDS=""
-
-          # Exported so the "Comment PR with Security Results" step below can
-          # apply the same exclusion list to the raw report - it reads
-          # pip-audit-report.json independently in JS, so without this the PR
-          # comment would show an accepted finding as live even though this
-          # gate correctly treats it as non-actionable.
-          echo "IGNORED_VULN_IDS=$IGNORED_VULN_IDS" >> "$GITHUB_ENV"
-          # Also a step output for the report-scheduled-result job, since
-          # $GITHUB_ENV does not cross jobs. Written before any `exit 1` below
-          # so it is set even when the audit fails.
-          echo "ignored_vuln_ids=$IGNORED_VULN_IDS" >> "$GITHUB_OUTPUT"
-
-          # No []? / || echo "0" fallback: if jq fails (malformed JSON) VULNS
-          # will be empty or "null" so Guard 3 below catches it rather than
-          # silently treating the broken report as zero.
-          # `.vulns // []` guards against skipped dependencies, which carry
-          # no vulns field at all (see the skip_reason handling above) -
-          # without the fallback, iterating `null[]` raises inside jq and
-          # this whole computation silently evaluates to empty.
-          #
-          # Matching checks `.id` AND `.aliases` (pip-audit includes aliases by
-          # default for JSON output): the OSV-backed report can surface either
-          # the GHSA or the CVE identifier as the canonical `id` for the same
-          # advisory, with the other one demoted to an alias, so matching on
-          # `.id` alone is not reliable.
-          VULNS=$(jq --arg ignored "$IGNORED_VULN_IDS" '
-            ($ignored | split(",") | map(select(length > 0))) as $ignore_list
-            | [.dependencies[] | (.vulns // [])[]
-               | select(([.id] + (.aliases // [])) as $ids | ($ids - $ignore_list | length) == ($ids | length))]
-            | length
-          ' pip-audit-report.json 2>/dev/null)
-
-          # Guard 3: ensure VULNS is a non-negative integer before the -gt
-          # comparison. "null" (missing/null key) or "" (jq parse failure) would
-          # cause bash's -gt to throw an arithmetic error and fall through to the
-          # success branch — the same silent-pass bug as a missing file.
-          if ! [[ "$VULNS" =~ ^[0-9]+$ ]]; then
-            echo "::error::pip-audit report exists but dependency vulnerabilities are missing or non-numeric (got: '${VULNS}'). The report may be malformed or contain an error-only JSON response. Treating as failure."
-            exit 1
-          fi
-
-          if [ "$VULNS" -gt 0 ]; then
-            echo "❌ Security vulnerabilities found: $VULNS"
-            echo "CI will fail to prevent merging of vulnerable dependencies"
-            echo ""
-            echo "Vulnerability details:"
-            jq --arg ignored "$IGNORED_VULN_IDS" -r '
-              ($ignored | split(",") | map(select(length > 0))) as $ignore_list
-              | .dependencies[] as $dependency
-              | ($dependency.vulns // [])[]
-              | select(([.id] + (.aliases // [])) as $ids | ($ids - $ignore_list | length) == ($ids | length))
-              | "- \($dependency.name)==\($dependency.version): \(.id)"
-            ' pip-audit-report.json || true
-            exit 1
-          else
-            echo "✅ No actionable security vulnerabilities found${IGNORED_VULN_IDS:+ (ignored: $IGNORED_VULN_IDS)}"
-            echo 'AUDIT_SCAN_STATUS=passed' >> "$GITHUB_ENV"
-          fi
-
-      - name: Run Bandit (Code Security Linter)
-        run: |
-          bandit -r semantica/ -f json -o bandit-report.json || true
-          echo "Checking for HIGH severity security issues..."
-          
-          # Count HIGH severity issues
-          HIGH_ISSUES=$(bandit -r semantica/ -f json -ll 2>/dev/null | jq -r '.results[]? | select(.issue_severity == "HIGH") | .test_name' 2>/dev/null | wc -l || echo "0")
-          
-          if [ "$HIGH_ISSUES" -gt 0 ]; then
-            echo "❌ HIGH severity security issues found: $HIGH_ISSUES"
-            echo "CI will fail to prevent merging of high-risk code"
-            echo ""
-            echo "High severity issues:"
-            bandit -r semantica/ -ll | grep "Severity: High" -A 5 -B 1 || true
-            exit 1
-          else
-            echo "✅ No HIGH severity security issues found"
-          fi
-        
-      - name: Run Semgrep (Static Analysis)
-        run: |
-          echo "Running Semgrep static analysis..."
-          semgrep --config=auto --json --output=semgrep-report.json semantica/ || true
-          
-          # Run security-focused rules
-          echo "Checking for security patterns..."
-          SECURITY_ISSUES=$(semgrep --config=p/security --json semantica/ 2>/dev/null | jq '.results | length' 2>/dev/null || echo "0")
-          
-          if [ "$SECURITY_ISSUES" -gt 0 ]; then
-            echo "⚠️ Security patterns found: $SECURITY_ISSUES"
-            echo "Review these findings for potential improvements"
-            semgrep --config=p/security semantica/ || true
-          else
-            echo "✅ No security patterns found"
-          fi
-        
-      - name: Upload Security Reports
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: security-reports
-          retention-days: 14
-          path: |
-            pip-audit-report.json
-            bandit-report.json
-            semgrep-report.json
-        
-      - name: Comment PR with Security Results
-        if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const fs = require('fs');
-
-            // Renders one tool's findings as a section. `items` is already
-            // the list of pre-formatted "- `thing` in `where`" strings; this
-            // just handles the found/not-found/report-missing framing and
-            // collapses long lists into a <details> block so the comment
-            // doesn't turn into a wall of text.
-            function renderSection(title, reportPath, parse) {
-              let data;
-              try {
-                data = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-              } catch (e) {
-                return [
-                  `### ${title}`,
-                  `⚠️ No report found at \`${reportPath}\` — the scan may have failed before producing output. Check the job logs.`,
-                ].join('\n');
-              }
-
-              const items = parse(data);
-              if (items === null) {
-                return [
-                  '### ' + title,
-                  '⚠️ Invalid report structure in ' + reportPath + ' — check the job logs.',
-                ].join('\n');
-              }
-              if (items.length === 0) {
-                return [`### ${title}`, `✅ No findings.`].join('\n');
-              }
-
-              const lines = [`### ${title}`, `Found **${items.length}**.`, ''];
-              const shown = items.slice(0, 15);
-              if (items.length > 15) {
-                lines.push('<details>', '<summary>Show all findings</summary>', '');
-                lines.push(...items);
-                lines.push('', '</details>');
-              } else {
-                lines.push(...shown);
-              }
-              return lines.join('\n');
-            }
-
-            // Mirrors the shell step's own IGNORED_VULN_IDS (passed through
-            // $GITHUB_ENV) so an accepted, non-actionable CVE that the CI
-            // gate already excluded doesn't reappear here as a live finding -
-            // this reads the same raw, unfiltered pip-audit-report.json.
-            const ignoredVulnIds = (process.env.IGNORED_VULN_IDS || '')
-              .split(',')
-              .map((id) => id.trim())
-              .filter(Boolean);
-
-            // A dependency pip-audit couldn't resolve/audit is reported as
-            // {"name": ..., "skip_reason": ...} with no vulns field at all
-            // (see pip_audit._format.json.JsonFormat._format_dep) - that's a
-            // normal report shape, not a malformed one, so it must not be
-            // treated as an invalid dependency below.
-            const isSkipped = (dependency) => typeof dependency.skip_reason === 'string';
-
-            let skippedDeps = [];
-            try {
-              const auditData = JSON.parse(fs.readFileSync('pip-audit-report.json', 'utf8'));
-              skippedDeps = (auditData.dependencies || []).filter(
-                (dependency) => dependency && typeof dependency === 'object' && isSkipped(dependency)
-              );
-            } catch (e) {
-              // Unreadable/unparseable report - renderSection's own
-              // report-missing branch below surfaces this.
-            }
-
-            const pipAuditSection = renderSection(
-              'pip-audit — dependency vulnerabilities',
-              'pip-audit-report.json',
-              (data) => {
-                if (
-                  !Array.isArray(data.dependencies) ||
-                  data.dependencies.length === 0 ||
-                  data.dependencies.some(
-                    (dependency) =>
-                      !dependency ||
-                      typeof dependency !== 'object' ||
-                      (!Array.isArray(dependency.vulns) && !isSkipped(dependency))
-                  )
-                ) {
-                  return null;
-                }
-
-                // A vuln's canonical `id` and its `aliases` (e.g. GHSA vs. CVE
-                // for the same advisory) are checked together - mirrors the
-                // shell gate above, which needs the same fallback because
-                // pip-audit's OSV-backed report doesn't consistently pick the
-                // same identifier as canonical across advisories.
-                return data.dependencies.flatMap((dependency) =>
-                  (dependency.vulns || [])
-                    .filter((vulnerability) =>
-                      ![vulnerability.id, ...(vulnerability.aliases || [])].some((id) => ignoredVulnIds.includes(id))
-                    )
-                    .map(
-                      (vulnerability) => `- \`${dependency.name}==${dependency.version}\`: ${vulnerability.id}` +
-                        (vulnerability.fix_versions?.length ? ` (fixed by ${vulnerability.fix_versions.join(', ')})` : '')
-                    )
-                );
-              }
-            ) + (ignoredVulnIds.length
-              ? `\n\n_Excluded as accepted, non-actionable findings: ${ignoredVulnIds.join(', ')} — see the workflow file's inline comments for why._`
-              : '') + (skippedDeps.length
-              ? `\n\n_Could not be audited: ${skippedDeps.map((d) => `\`${d.name}\` (${d.skip_reason})`).join(', ')}_`
-              : '');
-
-            const banditSection = renderSection(
-              'Bandit — HIGH-severity code issues',
-              'bandit-report.json',
-              (data) => (data.results || [])
-                .filter((issue) => issue.issue_severity === 'HIGH')
-                .map((issue) => `- \`${issue.test_name}\` in \`${issue.filename}:${issue.line_number}\``)
-            );
-
-            const semgrepSection = renderSection(
-              'Semgrep — static analysis patterns',
-              'semgrep-report.json',
-              (data) => (data.results || []).map(
-                (issue) => `- \`${issue.check_id}\` in \`${issue.path}:${issue.start?.line ?? '?'}\``
-              )
-            );
-
-            const comment = [
-              '# 🔒 Security Scan Results',
-              '',
-              pipAuditSection,
-              '',
-              banditSection,
-              '',
-              semgrepSection,
-              '',
-              '---',
-              '',
-              '*This security scan runs automatically on source-code PRs and daily (skipped for doc/markdown-only changes).*',
-              '',
-              '📊 **Security Policy**: CI fails on pip-audit vulnerabilities and Bandit HIGH-severity findings. Semgrep findings above are informational and do not block merge.',
-            ].join('\n');
-
-            try {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment,
-              });
-              console.log('✅ Security comment posted successfully');
-            } catch (error) {
-              console.log('⚠️ Could not post security comment:', error.message);
-              console.log('📋 Security scan results saved to artifacts');
-            }
-
-      - name: Enforce Audit Gate
-        if: always()
-        run: |
-          if [ "${AUDIT_SCAN_STATUS:-failed}" != "passed" ]; then
-            echo "::error::pip-audit scan failed. See the pip-audit output and uploaded reports above."
-            exit 1
-          fi
-
-  # Scheduled runs have no PR to comment on, so without this a failure on
-  # main is only visible to whoever opens the Actions tab. A separate job
-  # rather than a step in security-scan, because:
-  #   - only this job holds `issues: write`; the scan job installs
-  #     PR-controlled dependencies on pull_request runs.
-  #   - a cancelled or timed-out scan job never reaches its later steps, but
-  #     this job still runs after it.
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: |
+        pip install -r .github/requirements/bootstrap.txt --require-hashes
+        # Install the pinned dependency set FIRST so pip-audit scans
+        # Semantica's exact CI/release dependency tree (requirements-ci.txt
+        # is generated from pyproject.toml extras, so this covers the
+        # project's real deps).
+        pip install -r requirements-ci.txt --require-hashes
+        # Tooling AFTER the pinned set: installing it first would let the
+        # pinned requirements overwrite the tooling's own transitive deps.
+        pip install -r .github/requirements/pip-audit.txt --require-hashes
+        # --no-deps: security-scan-tools.txt overrides semgrep's pyjwt pin
+        # (see security-scan-tools-overrides.txt), which pip's resolver would
+        # otherwise reject. The file already hash-pins every transitive dep.
+        pip install -r .github/requirements/security-scan-tools.txt --require-hashes --no-deps
+    - name: Run pip-audit (Package Vulnerabilities)
+      id: pip_audit
+      continue-on-error: true
+      run: "# Keep publishing reports and the PR comment even when the audit\n# gate\
+        \ fails. The final gate below preserves the failure status.\necho 'AUDIT_SCAN_STATUS=failed'\
+        \ >> \"$GITHUB_ENV\"\n\n# Same dependency tree Safety used to scan, and the\
+        \ same tool and\n# invocation already proven reliable in security.yml.\n#\n\
+        # CI installs TWO locked dependency graphs, so both are audited:\n# requirements-ci.txt\
+        \ (generated from the `all` extra) and\n# .github/requirements/open-ontologies-extra.txt,\
+        \ which ci.yml\n# installs and imports to run the Open Ontologies integration\n\
+        # tests. The open-ontologies extra is deliberately kept out of\n# `all`, so\
+        \ requirements-ci.txt does not carry it: auditing only\n# that file would\
+        \ leave a disclosed vulnerability in\n# open-ontologies-lite, or in any package\
+        \ unique to its\n# resolution, unable to fail this gate.\npip-audit -r requirements-ci.txt\
+        \ --format=json --output=pip-audit-base.json || true\npip-audit -r .github/requirements/open-ontologies-extra.txt\
+        \ --format=json --output=pip-audit-open-ontologies.json || true\n\n# Guard\
+        \ 1: fail loudly if pip-audit exited before writing a report\n# at all (network\
+        \ error, tool crash). Without this check a missing\n# or empty file causes\
+        \ jq to fall back to \"0\", making a broken\n# scanner indistinguishable from\
+        \ a clean scan. Applied to each raw\n# report, so one silently failing audit\
+        \ cannot be hidden by the\n# other one succeeding.\nfor raw_report in pip-audit-base.json\
+        \ pip-audit-open-ontologies.json; do\n  if [ ! -s \"$raw_report\" ]; then\n\
+        \    echo \"::error::pip-audit produced no report ($raw_report is missing\
+        \ or empty). Treating as failure \u2014 check for network errors or pip-audit\
+        \ crashes in the logs above.\"\n    exit 1\n  fi\ndone\n\n# Merge into the\
+        \ single pip-audit-report.json that every step below\n# reads, so the validation,\
+        \ allowlist, counting, reporting and\n# artifact-upload logic stays exactly\
+        \ as it was.\n#\n# Both graphs resolve against the same constraint file and\
+        \ so share\n# most of their packages. Entries are deduplicated on\n# (lowercased\
+        \ name, version) and their vulns unioned by id \u2014\n# without that, one\
+        \ finding in a shared package would be counted\n# twice by the gate and listed\
+        \ twice in the PR comment. An entry\n# that pip-audit could audit (it carries\
+        \ a vulns array) is\n# preferred over the same package reported with a skip_reason,\
+        \ so\n# merging never downgrades a real result to an unaudited one.\n# `.[0]\
+        \ + {...}` keeps any other top-level keys pip-audit emits.\njq -s '\n  .[0]\
+        \ + {dependencies: (\n    [.[].dependencies[]]\n    # A space cannot occur\
+        \ in a PEP 508 name or a version, so it\n    # is a safe key separator; a\
+        \ \\u0000 escape would depend on how\n    # the jq build handles a NUL inside\
+        \ a string.\n    | group_by(((.name // \"\") | ascii_downcase) + \" \" + (.version\
+        \ // \"\"))\n    | map(\n        (((map(select(has(\"vulns\"))) | first) //\
+        \ .[0])) as $base\n        | if ($base | has(\"vulns\"))\n          then $base\
+        \ + {vulns: ([.[].vulns // []] | add | unique_by(.id))}\n          else $base\n\
+        \          end\n      )\n  )}\n' pip-audit-base.json pip-audit-open-ontologies.json\
+        \ > pip-audit-report.json\n\n# Guard 1b: a jq failure above leaves an empty\
+        \ file, which would\n# read as a clean scan to everything below.\nif [ ! -s\
+        \ pip-audit-report.json ]; then\n  echo \"::error::Merging the pip-audit reports\
+        \ produced no output (pip-audit-report.json is missing or empty). Treating\
+        \ as failure \u2014 check the jq invocation above.\"\n  exit 1\nfi\n\n# Guard\
+        \ 2: fail closed when the report doesn't have the shape the\n# checks below\
+        \ assume: a non-empty dependencies array, each entry\n# either carrying an\
+        \ array-valued vulns field or being a dependency\n# pip-audit couldn't resolve/audit,\
+        \ which it reports as\n# {\"name\": ..., \"skip_reason\": ...} with no vulns\
+        \ field at all\n# (see pip_audit._format.json.JsonFormat._format_dep). That's\
+        \ a\n# normal, documented report shape, not a malformed one \u2014 treating\n\
+        # it as invalid would fail the whole job over a single unauditable\n# package,\
+        \ the same kind of scan-unrelated CI break this migration\n# away from Safety\
+        \ was meant to fix.\nif ! jq -e '\n  (.dependencies | type == \"array\" and\
+        \ length > 0)\n  and all(.dependencies[]; type == \"object\" and ((.vulns\
+        \ | type == \"array\") or (.skip_reason | type == \"string\")))\n' pip-audit-report.json\
+        \ >/dev/null 2>&1; then\n  echo \"::error::pip-audit report has an invalid\
+        \ dependency structure. Expected a non-empty dependencies array where every\
+        \ entry has either a vulns array or a skip_reason. Treating as failure.\"\n\
+        \  exit 1\nfi\n\necho \"Checking for package vulnerabilities...\"\n\n# Guard\
+        \ 2 above already confirmed pip-audit-report.json is valid\n# JSON with a\
+        \ well-shaped dependencies array, so this count is\n# always a plain non-negative\
+        \ integer.\nSKIPPED=$(jq '[.dependencies[] | select(has(\"skip_reason\"))]\
+        \ | length' pip-audit-report.json)\nif [ \"$SKIPPED\" -gt 0 ]; then\n  echo\
+        \ \"\u26A0\uFE0F pip-audit could not audit $SKIPPED dependencies (see pip-audit-report.json\
+        \ for skip_reason):\"\n  jq -r '.dependencies[] | select(has(\"skip_reason\"\
+        )) | \"  - \\(.name): \\(.skip_reason)\"' pip-audit-report.json\nfi\n\n# Clearing\
+        \ an advisory: bump the package to the latest release with\n# no known advisories,\
+        \ not to the first fixed version. #1924 moved\n# docling only to 2.131.0,\
+        \ the first release fixing one advisory,\n# and three more advisories against\
+        \ <2.132.0 failed every PR a day\n# later. Ignoring an ID below is for findings\
+        \ that are reviewed\n# and genuinely non-actionable, never a way to get CI\
+        \ green.\n#\n# Vulnerability IDs accepted for this project. Comma-separated;\
+        \ give\n# each entry a comment here saying what it covers and when to\n# re-evaluate\
+        \ it.\n#   NOTE: pip-audit's OSV-backed report may surface either identifier\
+        \ as\n#   the primary `id` (with the other listed under `aliases`) depending\
+        \ on\n#   which alias the backing database picks as canonical, so list both\n\
+        #   the GHSA and the CVE id of an advisory here; the matching below\n#   checks\
+        \ aliases too - see\n#   https://github.com/semantica-agi/semantica/actions/runs/34296586683\n\
+        #   where this ignore list had only the GHSA id but the report's `id`\n# \
+        \  was the CVE, so the gate still failed.\n# None accepted at the moment.\n\
+        IGNORED_VULN_IDS=\"\"\n\n# Exported so the \"Comment PR with Security Results\"\
+        \ step below can\n# apply the same exclusion list to the raw report - it reads\n\
+        # pip-audit-report.json independently in JS, so without this the PR\n# comment\
+        \ would show an accepted finding as live even though this\n# gate correctly\
+        \ treats it as non-actionable.\necho \"IGNORED_VULN_IDS=$IGNORED_VULN_IDS\"\
+        \ >> \"$GITHUB_ENV\"\n# Also a step output for the report-scheduled-result\
+        \ job, since\n# $GITHUB_ENV does not cross jobs. Written before any `exit\
+        \ 1` below\n# so it is set even when the audit fails.\necho \"ignored_vuln_ids=$IGNORED_VULN_IDS\"\
+        \ >> \"$GITHUB_OUTPUT\"\n\n# No []? / || echo \"0\" fallback: if jq fails\
+        \ (malformed JSON) VULNS\n# will be empty or \"null\" so Guard 3 below catches\
+        \ it rather than\n# silently treating the broken report as zero.\n# `.vulns\
+        \ // []` guards against skipped dependencies, which carry\n# no vulns field\
+        \ at all (see the skip_reason handling above) -\n# without the fallback, iterating\
+        \ `null[]` raises inside jq and\n# this whole computation silently evaluates\
+        \ to empty.\n#\n# Matching checks `.id` AND `.aliases` (pip-audit includes\
+        \ aliases by\n# default for JSON output): the OSV-backed report can surface\
+        \ either\n# the GHSA or the CVE identifier as the canonical `id` for the same\n\
+        # advisory, with the other one demoted to an alias, so matching on\n# `.id`\
+        \ alone is not reliable.\nVULNS=$(jq --arg ignored \"$IGNORED_VULN_IDS\" '\n\
+        \  ($ignored | split(\",\") | map(select(length > 0))) as $ignore_list\n \
+        \ | [.dependencies[] | (.vulns // [])[]\n     | select(([.id] + (.aliases\
+        \ // [])) as $ids | ($ids - $ignore_list | length) == ($ids | length))]\n\
+        \  | length\n' pip-audit-report.json 2>/dev/null)\n\n# Guard 3: ensure VULNS\
+        \ is a non-negative integer before the -gt\n# comparison. \"null\" (missing/null\
+        \ key) or \"\" (jq parse failure) would\n# cause bash's -gt to throw an arithmetic\
+        \ error and fall through to the\n# success branch \u2014 the same silent-pass\
+        \ bug as a missing file.\nif ! [[ \"$VULNS\" =~ ^[0-9]+$ ]]; then\n  echo\
+        \ \"::error::pip-audit report exists but dependency vulnerabilities are missing\
+        \ or non-numeric (got: '${VULNS}'). The report may be malformed or contain\
+        \ an error-only JSON response. Treating as failure.\"\n  exit 1\nfi\n\nif\
+        \ [ \"$VULNS\" -gt 0 ]; then\n  echo \"\u274C Security vulnerabilities found:\
+        \ $VULNS\"\n  echo \"CI will fail to prevent merging of vulnerable dependencies\"\
+        \n  echo \"\"\n  echo \"Vulnerability details:\"\n  jq --arg ignored \"$IGNORED_VULN_IDS\"\
+        \ -r '\n    ($ignored | split(\",\") | map(select(length > 0))) as $ignore_list\n\
+        \    | .dependencies[] as $dependency\n    | ($dependency.vulns // [])[]\n\
+        \    | select(([.id] + (.aliases // [])) as $ids | ($ids - $ignore_list |\
+        \ length) == ($ids | length))\n    | \"- \\($dependency.name)==\\($dependency.version):\
+        \ \\(.id)\"\n  ' pip-audit-report.json || true\n  exit 1\nelse\n  echo \"\u2705\
+        \ No actionable security vulnerabilities found${IGNORED_VULN_IDS:+ (ignored:\
+        \ $IGNORED_VULN_IDS)}\"\n  echo 'AUDIT_SCAN_STATUS=passed' >> \"$GITHUB_ENV\"\
+        \nfi\n"
+    - name: Run Bandit (Code Security Linter)
+      run: "bandit -r semantica/ -f json -o bandit-report.json || true\necho \"Checking\
+        \ for HIGH severity security issues...\"\n\n# Count HIGH severity issues\n\
+        HIGH_ISSUES=$(bandit -r semantica/ -f json -ll 2>/dev/null | jq -r '.results[]?\
+        \ | select(.issue_severity == \"HIGH\") | .test_name' 2>/dev/null | wc -l\
+        \ || echo \"0\")\n\nif [ \"$HIGH_ISSUES\" -gt 0 ]; then\n  echo \"\u274C HIGH\
+        \ severity security issues found: $HIGH_ISSUES\"\n  echo \"CI will fail to\
+        \ prevent merging of high-risk code\"\n  echo \"\"\n  echo \"High severity\
+        \ issues:\"\n  bandit -r semantica/ -ll | grep \"Severity: High\" -A 5 -B\
+        \ 1 || true\n  exit 1\nelse\n  echo \"\u2705 No HIGH severity security issues\
+        \ found\"\nfi\n"
+    - name: Run Semgrep (Static Analysis)
+      run: "echo \"Running Semgrep static analysis...\"\nsemgrep --config=auto --json\
+        \ --output=semgrep-report.json semantica/ || true\n\n# Run security-focused\
+        \ rules\necho \"Checking for security patterns...\"\nSECURITY_ISSUES=$(semgrep\
+        \ --config=p/security --json semantica/ 2>/dev/null | jq '.results | length'\
+        \ 2>/dev/null || echo \"0\")\n\nif [ \"$SECURITY_ISSUES\" -gt 0 ]; then\n\
+        \  echo \"\u26A0\uFE0F Security patterns found: $SECURITY_ISSUES\"\n  echo\
+        \ \"Review these findings for potential improvements\"\n  semgrep --config=p/security\
+        \ semantica/ || true\nelse\n  echo \"\u2705 No security patterns found\"\n\
+        fi\n"
+    - name: Upload Security Reports
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: security-reports
+        retention-days: 14
+        path: |
+          pip-audit-report.json
+          bandit-report.json
+          semgrep-report.json
+    - name: Comment PR with Security Results
+      if: always() && github.event_name == 'pull_request'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+      with:
+        script: "const fs = require('fs');\n\n// Renders one tool's findings as a\
+          \ section. `items` is already\n// the list of pre-formatted \"- `thing`\
+          \ in `where`\" strings; this\n// just handles the found/not-found/report-missing\
+          \ framing and\n// collapses long lists into a <details> block so the comment\n\
+          // doesn't turn into a wall of text.\nfunction renderSection(title, reportPath,\
+          \ parse) {\n  let data;\n  try {\n    data = JSON.parse(fs.readFileSync(reportPath,\
+          \ 'utf8'));\n  } catch (e) {\n    return [\n      `### ${title}`,\n    \
+          \  `\u26A0\uFE0F No report found at \\`${reportPath}\\` \u2014 the scan\
+          \ may have failed before producing output. Check the job logs.`,\n    ].join('\\\
+          n');\n  }\n\n  const items = parse(data);\n  if (items === null) {\n   \
+          \ return [\n      '### ' + title,\n      '\u26A0\uFE0F Invalid report structure\
+          \ in ' + reportPath + ' \u2014 check the job logs.',\n    ].join('\\n');\n\
+          \  }\n  if (items.length === 0) {\n    return [`### ${title}`, `\u2705 No\
+          \ findings.`].join('\\n');\n  }\n\n  const lines = [`### ${title}`, `Found\
+          \ **${items.length}**.`, ''];\n  const shown = items.slice(0, 15);\n  if\
+          \ (items.length > 15) {\n    lines.push('<details>', '<summary>Show all\
+          \ findings</summary>', '');\n    lines.push(...items);\n    lines.push('',\
+          \ '</details>');\n  } else {\n    lines.push(...shown);\n  }\n  return lines.join('\\\
+          n');\n}\n\n// Mirrors the shell step's own IGNORED_VULN_IDS (passed through\n\
+          // $GITHUB_ENV) so an accepted, non-actionable CVE that the CI\n// gate\
+          \ already excluded doesn't reappear here as a live finding -\n// this reads\
+          \ the same raw, unfiltered pip-audit-report.json.\nconst ignoredVulnIds\
+          \ = (process.env.IGNORED_VULN_IDS || '')\n  .split(',')\n  .map((id) =>\
+          \ id.trim())\n  .filter(Boolean);\n\n// A dependency pip-audit couldn't\
+          \ resolve/audit is reported as\n// {\"name\": ..., \"skip_reason\": ...}\
+          \ with no vulns field at all\n// (see pip_audit._format.json.JsonFormat._format_dep)\
+          \ - that's a\n// normal report shape, not a malformed one, so it must not\
+          \ be\n// treated as an invalid dependency below.\nconst isSkipped = (dependency)\
+          \ => typeof dependency.skip_reason === 'string';\n\nlet skippedDeps = [];\n\
+          try {\n  const auditData = JSON.parse(fs.readFileSync('pip-audit-report.json',\
+          \ 'utf8'));\n  skippedDeps = (auditData.dependencies || []).filter(\n  \
+          \  (dependency) => dependency && typeof dependency === 'object' && isSkipped(dependency)\n\
+          \  );\n} catch (e) {\n  // Unreadable/unparseable report - renderSection's\
+          \ own\n  // report-missing branch below surfaces this.\n}\n\nconst pipAuditSection\
+          \ = renderSection(\n  'pip-audit \u2014 dependency vulnerabilities',\n \
+          \ 'pip-audit-report.json',\n  (data) => {\n    if (\n      !Array.isArray(data.dependencies)\
+          \ ||\n      data.dependencies.length === 0 ||\n      data.dependencies.some(\n\
+          \        (dependency) =>\n          !dependency ||\n          typeof dependency\
+          \ !== 'object' ||\n          (!Array.isArray(dependency.vulns) && !isSkipped(dependency))\n\
+          \      )\n    ) {\n      return null;\n    }\n\n    // A vuln's canonical\
+          \ `id` and its `aliases` (e.g. GHSA vs. CVE\n    // for the same advisory)\
+          \ are checked together - mirrors the\n    // shell gate above, which needs\
+          \ the same fallback because\n    // pip-audit's OSV-backed report doesn't\
+          \ consistently pick the\n    // same identifier as canonical across advisories.\n\
+          \    return data.dependencies.flatMap((dependency) =>\n      (dependency.vulns\
+          \ || [])\n        .filter((vulnerability) =>\n          ![vulnerability.id,\
+          \ ...(vulnerability.aliases || [])].some((id) => ignoredVulnIds.includes(id))\n\
+          \        )\n        .map(\n          (vulnerability) => `- \\`${dependency.name}==${dependency.version}\\\
+          `: ${vulnerability.id}` +\n            (vulnerability.fix_versions?.length\
+          \ ? ` (fixed by ${vulnerability.fix_versions.join(', ')})` : '')\n     \
+          \   )\n    );\n  }\n) + (ignoredVulnIds.length\n  ? `\\n\\n_Excluded as\
+          \ accepted, non-actionable findings: ${ignoredVulnIds.join(', ')} \u2014\
+          \ see the workflow file's inline comments for why._`\n  : '') + (skippedDeps.length\n\
+          \  ? `\\n\\n_Could not be audited: ${skippedDeps.map((d) => `\\`${d.name}\\\
+          ` (${d.skip_reason})`).join(', ')}_`\n  : '');\n\nconst banditSection =\
+          \ renderSection(\n  'Bandit \u2014 HIGH-severity code issues',\n  'bandit-report.json',\n\
+          \  (data) => (data.results || [])\n    .filter((issue) => issue.issue_severity\
+          \ === 'HIGH')\n    .map((issue) => `- \\`${issue.test_name}\\` in \\`${issue.filename}:${issue.line_number}\\\
+          ``)\n);\n\nconst semgrepSection = renderSection(\n  'Semgrep \u2014 static\
+          \ analysis patterns',\n  'semgrep-report.json',\n  (data) => (data.results\
+          \ || []).map(\n    (issue) => `- \\`${issue.check_id}\\` in \\`${issue.path}:${issue.start?.line\
+          \ ?? '?'}\\``\n  )\n);\n\nconst comment = [\n  '# \U0001F512 Security Scan\
+          \ Results',\n  '',\n  pipAuditSection,\n  '',\n  banditSection,\n  '',\n\
+          \  semgrepSection,\n  '',\n  '---',\n  '',\n  '*This security scan runs\
+          \ automatically on source-code PRs and daily (skipped for doc/markdown-only\
+          \ changes).*',\n  '',\n  '\U0001F4CA **Security Policy**: CI fails on pip-audit\
+          \ vulnerabilities and Bandit HIGH-severity findings. Semgrep findings above\
+          \ are informational and do not block merge.',\n].join('\\n');\n\ntry {\n\
+          \  await github.rest.issues.createComment({\n    issue_number: context.issue.number,\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    body:\
+          \ comment,\n  });\n  console.log('\u2705 Security comment posted successfully');\n\
+          } catch (error) {\n  console.log('\u26A0\uFE0F Could not post security comment:',\
+          \ error.message);\n  console.log('\U0001F4CB Security scan results saved\
+          \ to artifacts');\n}\n"
+    - name: Enforce Audit Gate
+      if: always()
+      run: |
+        if [ "${AUDIT_SCAN_STATUS:-failed}" != "passed" ]; then
+          echo "::error::pip-audit scan failed. See the pip-audit output and uploaded reports above."
+          exit 1
+        fi
+    timeout-minutes: 45
   report-scheduled-result:
-    needs: [security-scan]
-    # always(), not failure(): failure() is false for cancelled runs, and a
-    # successful run is needed too, to close the tracking issue. The script
-    # acts on needs.security-scan.result.
-    if: always() && github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    # No contents: read; this job never checks out the repository.
+    needs:
+    - security-scan
+    if: ${{ !cancelled() && (always() && github.event_name == 'schedule') }}
+    runs-on: self-hosted
     permissions:
-      # Create the label, and open, comment on and close the tracking issue.
       issues: write
-      # List this run's jobs and steps, to name the failed steps in the issue.
       actions: read
     steps:
-      # continue-on-error: a run cancelled before the upload step has no
-      # artifact; the script below then reports the audit report as missing.
-      - name: Download security reports
-        if: needs.security-scan.result != 'success'
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: security-reports
-          path: security-reports
-
-      - name: Report scheduled result
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          SCAN_RESULT: ${{ needs.security-scan.result }}
-          IGNORED_VULN_IDS: ${{ needs.security-scan.outputs.ignored_vuln_ids }}
-        with:
-          script: |
-            const fs = require('fs');
-
-            // One tracking issue, found by this label, collects every
-            // scheduled failure until the scan passes again. Later failures
-            // add a comment instead of opening duplicates.
-            const label = 'security-scan-failure';
-            const { owner, repo } = context.repo;
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const scanResult = process.env.SCAN_RESULT;
-
-            // Open tracking issues, oldest first. PRs share the issues API
-            // and can carry the label, so they are excluded. Listing by a
-            // label that does not exist yet returns an empty list.
-            const listOpen = async () =>
-              (await github.paginate(github.rest.issues.listForRepo, {
-                owner, repo, state: 'open', labels: label,
-              }))
-                .filter((issue) => !issue.pull_request)
-                .sort((a, b) => a.number - b.number);
-
-            // A re-run keeps the original event and commit, so re-running an
-            // older scheduled run must not close or open the tracking issue
-            // for a newer one. Only the latest scheduled run acts on it.
-            const { data: thisRun } = await github.rest.actions.getWorkflowRun({
-              owner, repo, run_id: context.runId,
-            });
-            const { data: { workflow_runs: [latest] } } = await github.rest.actions.listWorkflowRuns({
-              owner, repo, workflow_id: thisRun.workflow_id, event: 'schedule', per_page: 1,
-            });
-            if (latest && latest.run_number > thisRun.run_number) {
-              console.log(`Newer scheduled run #${latest.run_number} (${latest.html_url}) supersedes this one (#${thisRun.run_number}); leaving the tracking issue unchanged.`);
-              return;
-            }
-
-            // The scan recovered: close every open tracking issue.
-            if (scanResult === 'success') {
-              const open = await listOpen();
-              for (const issue of open) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: issue.number,
-                  body: `Scheduled Security Scan passed again on \`${context.ref}\` at \`${context.sha.slice(0, 7)}\`: ${runUrl}. Closing.`,
-                });
-                await github.rest.issues.update({
-                  owner, repo, issue_number: issue.number,
-                  state: 'closed', state_reason: 'completed',
-                });
-                console.log(`Closed #${issue.number} (scan recovered)`);
-              }
-              if (!open.length) console.log('Scan passed; no open tracking issue to close.');
-              return;
-            }
-
-            // Same exclusion list the gate applied, so the issue lists
-            // exactly what failed the gate.
-            const ignoredVulnIds = (process.env.IGNORED_VULN_IDS || '')
-              .split(',')
-              .map((id) => id.trim())
-              .filter(Boolean);
-
-            // Escapes a value for a markdown table cell: `|` would end the
-            // cell, a backtick would open a code span, and a row must stay on
-            // one line.
-            const cell = (value) => String(value ?? '')
-              .replace(/[\r\n]+/g, ' ')
-              .replace(/\|/g, '\\|')
-              .replace(/`/g, '\\`');
-
-            // 'missing' (no file), 'invalid' (unparseable, or not the shape
-            // the gate's Guard 2 accepts) or 'valid'. Only a valid report may
-            // be summarised as having no actionable vulnerabilities.
-            let reportState = 'valid';
-            let findings = [];
-            let report;
-            try {
-              report = JSON.parse(fs.readFileSync('security-reports/pip-audit-report.json', 'utf8'));
-            } catch (e) {
-              reportState = e.code === 'ENOENT' ? 'missing' : 'invalid';
-            }
-            if (reportState === 'valid') {
-              const dependencies = report && report.dependencies;
-              const wellFormed = Array.isArray(dependencies) && dependencies.length > 0 &&
-                dependencies.every((dependency) =>
-                  dependency && typeof dependency === 'object' &&
-                  (Array.isArray(dependency.vulns) || typeof dependency.skip_reason === 'string')
-                );
-              if (!wellFormed) reportState = 'invalid';
-            }
-            if (reportState === 'valid') {
-              findings = report.dependencies.flatMap((dependency) =>
-                (dependency.vulns || [])
-                  .filter((vulnerability) =>
-                    ![vulnerability.id, ...(vulnerability.aliases || [])].some((id) => ignoredVulnIds.includes(id))
-                  )
-                  .map((vulnerability) => {
-                    const aliases = (vulnerability.aliases || []).join(', ');
-                    const fixes = (vulnerability.fix_versions || []).join(', ');
-                    // Plain text, not a code span: a backtick inside a code
-                    // span cannot be escaped.
-                    return `| ${cell(dependency.name)} | ${cell(dependency.version)} | ${cell(vulnerability.id)} | ${cell(aliases) || '—'} | ${cell(fixes) || 'none yet'} |`;
-                  })
-              );
-            }
-
-            // The failure may not come from pip-audit at all (Bandit, a
-            // dependency install, a missing report), so name the failed steps
-            // too: a scheduled failure must never go unreported.
-            let failedSteps = [];
-            try {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner, repo, run_id: context.runId,
-              });
-              failedSteps = jobs.flatMap((job) =>
-                (job.steps || [])
-                  // Cancelled steps show where a cancelled or timed-out run
-                  // stopped.
-                  .filter((step) => step.conclusion === 'failure' || step.conclusion === 'cancelled')
-                  .map((step) => `${job.name} / ${step.name} (${step.conclusion})`)
-              );
-            } catch (e) {
-              console.log('Could not list failed steps:', e.message);
-            }
-
-            // GitHub rejects an issue or comment body over 65,536 characters,
-            // and then no issue is opened at all. .length counts UTF-16 code
-            // units, never fewer than characters, so capping on it is safe.
-            const MAX_BODY = 65536;
-
-            // `rows` are the findings shown, `omitted` how many were cut to
-            // fit MAX_BODY.
-            const buildBody = (rows, omitted) => {
-              let vulnSection;
-              if (reportState === 'missing') {
-                vulnSection = '⚠️ `pip-audit-report.json` is missing — the audit did not complete. Check the run logs.';
-              } else if (reportState === 'invalid') {
-                vulnSection = '⚠️ pip-audit report was empty or invalid — the audit result cannot be trusted. Check the run logs.';
-              } else if (rows.length === 0 && omitted === 0) {
-                vulnSection = 'pip-audit reported no actionable vulnerabilities; the failure is in another step (see above).';
-              } else {
-                vulnSection = [
-                  '| Package | Version | ID | Aliases | First fixed |',
-                  '|---|---|---|---|---|',
-                  ...rows,
-                ].join('\n') + (omitted
-                  ? `\n\n_${omitted} more finding(s) not shown, to keep this under GitHub's 65,536-character limit. The full list is in the \`security-reports\` artifact of the run linked above._`
-                  : '');
-              }
-
-              return [
-                `Scheduled Security Scan ${scanResult === 'failure' ? 'failed' : `did not complete (result: \`${scanResult}\`)`} on \`${context.ref}\` at \`${context.sha.slice(0, 7)}\`: ${runUrl}`,
-                '',
-                '**Failed steps:** ' + (failedSteps.length ? failedSteps.map((s) => `\`${s}\``).join(', ') : 'unknown (see run)'),
-                '',
-                '### Vulnerable dependencies',
-                vulnSection,
-                '',
-                'When clearing an advisory, bump to the latest release with no known advisories, not the first fixed version — see the note above `IGNORED_VULN_IDS` in `.github/workflows/security-scan.yml`.',
-              ].join('\n');
-            };
-
-            let body = buildBody(findings, 0);
-            if (body.length > MAX_BODY) {
-              // Start from the body with no rows (it already carries the
-              // "not shown" note) and add rows while they fit. The note only
-              // gets shorter as rows are added. +1 is the joining newline.
-              let used = buildBody([], findings.length).length;
-              let shown = 0;
-              while (shown < findings.length && used + findings[shown].length + 1 <= MAX_BODY) {
-                used += findings[shown].length + 1;
-                shown++;
-              }
-              body = buildBody(findings.slice(0, shown), findings.length - shown);
-            }
-            // Last resort, e.g. for a very long failed-steps list.
-            if (body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
-
-            try {
-              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'b60205' });
-            } catch (e) {
-              // 422: the label already exists. Anything else is rethrown:
-              // the tracking issue is found by this label, so nothing below
-              // works without it.
-              if (e.status !== 422) throw e;
-            }
-
-            const [existing] = await listOpen();
-
-            let postedTo;
-            if (existing) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: existing.number, body,
-              });
-              postedTo = existing.number;
-              console.log(`Updated #${existing.number}`);
-            } else {
-              const { data: created } = await github.rest.issues.create({
-                owner, repo,
-                title: 'Scheduled Security Scan is failing on main',
-                labels: [label],
-                body,
-              });
-              postedTo = created.number;
-              console.log(`Opened #${created.number}`);
-            }
-
-            // Two runs that both found no issue can each open one. Keep
-            // the lowest-numbered issue and close the rest, so every run
-            // converges on the same tracking issue. Runs every time, so
-            // duplicates left by earlier runs are closed too.
-            const [keep, ...duplicates] = await listOpen();
-            if (keep && keep.number !== postedTo) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: keep.number, body,
-              });
-              console.log(`Moved this run's report to #${keep.number}`);
-            }
-            for (const duplicate of duplicates) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: duplicate.number,
-                body: `Duplicate of #${keep.number}. Closing; scheduled scan failures are tracked there.`,
-              });
-              await github.rest.issues.update({
-                owner, repo, issue_number: duplicate.number,
-                state: 'closed', state_reason: 'not_planned',
-              });
-              console.log(`Closed duplicate #${duplicate.number}`);
-            }
+    - name: Download security reports
+      if: needs.security-scan.result != 'success'
+      continue-on-error: true
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: security-reports
+        path: security-reports
+    - name: Report scheduled result
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+      env:
+        SCAN_RESULT: ${{ needs.security-scan.result }}
+        IGNORED_VULN_IDS: ${{ needs.security-scan.outputs.ignored_vuln_ids }}
+      with:
+        script: "const fs = require('fs');\n\n// One tracking issue, found by this\
+          \ label, collects every\n// scheduled failure until the scan passes again.\
+          \ Later failures\n// add a comment instead of opening duplicates.\nconst\
+          \ label = 'security-scan-failure';\nconst { owner, repo } = context.repo;\n\
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;\n\
+          const scanResult = process.env.SCAN_RESULT;\n\n// Open tracking issues,\
+          \ oldest first. PRs share the issues API\n// and can carry the label, so\
+          \ they are excluded. Listing by a\n// label that does not exist yet returns\
+          \ an empty list.\nconst listOpen = async () =>\n  (await github.paginate(github.rest.issues.listForRepo,\
+          \ {\n    owner, repo, state: 'open', labels: label,\n  }))\n    .filter((issue)\
+          \ => !issue.pull_request)\n    .sort((a, b) => a.number - b.number);\n\n\
+          // A re-run keeps the original event and commit, so re-running an\n// older\
+          \ scheduled run must not close or open the tracking issue\n// for a newer\
+          \ one. Only the latest scheduled run acts on it.\nconst { data: thisRun\
+          \ } = await github.rest.actions.getWorkflowRun({\n  owner, repo, run_id:\
+          \ context.runId,\n});\nconst { data: { workflow_runs: [latest] } } = await\
+          \ github.rest.actions.listWorkflowRuns({\n  owner, repo, workflow_id: thisRun.workflow_id,\
+          \ event: 'schedule', per_page: 1,\n});\nif (latest && latest.run_number\
+          \ > thisRun.run_number) {\n  console.log(`Newer scheduled run #${latest.run_number}\
+          \ (${latest.html_url}) supersedes this one (#${thisRun.run_number}); leaving\
+          \ the tracking issue unchanged.`);\n  return;\n}\n\n// The scan recovered:\
+          \ close every open tracking issue.\nif (scanResult === 'success') {\n  const\
+          \ open = await listOpen();\n  for (const issue of open) {\n    await github.rest.issues.createComment({\n\
+          \      owner, repo, issue_number: issue.number,\n      body: `Scheduled\
+          \ Security Scan passed again on \\`${context.ref}\\` at \\`${context.sha.slice(0,\
+          \ 7)}\\`: ${runUrl}. Closing.`,\n    });\n    await github.rest.issues.update({\n\
+          \      owner, repo, issue_number: issue.number,\n      state: 'closed',\
+          \ state_reason: 'completed',\n    });\n    console.log(`Closed #${issue.number}\
+          \ (scan recovered)`);\n  }\n  if (!open.length) console.log('Scan passed;\
+          \ no open tracking issue to close.');\n  return;\n}\n\n// Same exclusion\
+          \ list the gate applied, so the issue lists\n// exactly what failed the\
+          \ gate.\nconst ignoredVulnIds = (process.env.IGNORED_VULN_IDS || '')\n \
+          \ .split(',')\n  .map((id) => id.trim())\n  .filter(Boolean);\n\n// Escapes\
+          \ a value for a markdown table cell: `|` would end the\n// cell, a backtick\
+          \ would open a code span, and a row must stay on\n// one line.\nconst cell\
+          \ = (value) => String(value ?? '')\n  .replace(/[\\r\\n]+/g, ' ')\n  .replace(/\\\
+          |/g, '\\\\|')\n  .replace(/`/g, '\\\\`');\n\n// 'missing' (no file), 'invalid'\
+          \ (unparseable, or not the shape\n// the gate's Guard 2 accepts) or 'valid'.\
+          \ Only a valid report may\n// be summarised as having no actionable vulnerabilities.\n\
+          let reportState = 'valid';\nlet findings = [];\nlet report;\ntry {\n  report\
+          \ = JSON.parse(fs.readFileSync('security-reports/pip-audit-report.json',\
+          \ 'utf8'));\n} catch (e) {\n  reportState = e.code === 'ENOENT' ? 'missing'\
+          \ : 'invalid';\n}\nif (reportState === 'valid') {\n  const dependencies\
+          \ = report && report.dependencies;\n  const wellFormed = Array.isArray(dependencies)\
+          \ && dependencies.length > 0 &&\n    dependencies.every((dependency) =>\n\
+          \      dependency && typeof dependency === 'object' &&\n      (Array.isArray(dependency.vulns)\
+          \ || typeof dependency.skip_reason === 'string')\n    );\n  if (!wellFormed)\
+          \ reportState = 'invalid';\n}\nif (reportState === 'valid') {\n  findings\
+          \ = report.dependencies.flatMap((dependency) =>\n    (dependency.vulns ||\
+          \ [])\n      .filter((vulnerability) =>\n        ![vulnerability.id, ...(vulnerability.aliases\
+          \ || [])].some((id) => ignoredVulnIds.includes(id))\n      )\n      .map((vulnerability)\
+          \ => {\n        const aliases = (vulnerability.aliases || []).join(', ');\n\
+          \        const fixes = (vulnerability.fix_versions || []).join(', ');\n\
+          \        // Plain text, not a code span: a backtick inside a code\n    \
+          \    // span cannot be escaped.\n        return `| ${cell(dependency.name)}\
+          \ | ${cell(dependency.version)} | ${cell(vulnerability.id)} | ${cell(aliases)\
+          \ || '\u2014'} | ${cell(fixes) || 'none yet'} |`;\n      })\n  );\n}\n\n\
+          // The failure may not come from pip-audit at all (Bandit, a\n// dependency\
+          \ install, a missing report), so name the failed steps\n// too: a scheduled\
+          \ failure must never go unreported.\nlet failedSteps = [];\ntry {\n  const\
+          \ jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,\
+          \ {\n    owner, repo, run_id: context.runId,\n  });\n  failedSteps = jobs.flatMap((job)\
+          \ =>\n    (job.steps || [])\n      // Cancelled steps show where a cancelled\
+          \ or timed-out run\n      // stopped.\n      .filter((step) => step.conclusion\
+          \ === 'failure' || step.conclusion === 'cancelled')\n      .map((step) =>\
+          \ `${job.name} / ${step.name} (${step.conclusion})`)\n  );\n} catch (e)\
+          \ {\n  console.log('Could not list failed steps:', e.message);\n}\n\n//\
+          \ GitHub rejects an issue or comment body over 65,536 characters,\n// and\
+          \ then no issue is opened at all. .length counts UTF-16 code\n// units,\
+          \ never fewer than characters, so capping on it is safe.\nconst MAX_BODY\
+          \ = 65536;\n\n// `rows` are the findings shown, `omitted` how many were\
+          \ cut to\n// fit MAX_BODY.\nconst buildBody = (rows, omitted) => {\n  let\
+          \ vulnSection;\n  if (reportState === 'missing') {\n    vulnSection = '\u26A0\
+          \uFE0F `pip-audit-report.json` is missing \u2014 the audit did not complete.\
+          \ Check the run logs.';\n  } else if (reportState === 'invalid') {\n   \
+          \ vulnSection = '\u26A0\uFE0F pip-audit report was empty or invalid \u2014\
+          \ the audit result cannot be trusted. Check the run logs.';\n  } else if\
+          \ (rows.length === 0 && omitted === 0) {\n    vulnSection = 'pip-audit reported\
+          \ no actionable vulnerabilities; the failure is in another step (see above).';\n\
+          \  } else {\n    vulnSection = [\n      '| Package | Version | ID | Aliases\
+          \ | First fixed |',\n      '|---|---|---|---|---|',\n      ...rows,\n  \
+          \  ].join('\\n') + (omitted\n      ? `\\n\\n_${omitted} more finding(s)\
+          \ not shown, to keep this under GitHub's 65,536-character limit. The full\
+          \ list is in the \\`security-reports\\` artifact of the run linked above._`\n\
+          \      : '');\n  }\n\n  return [\n    `Scheduled Security Scan ${scanResult\
+          \ === 'failure' ? 'failed' : `did not complete (result: \\`${scanResult}\\\
+          `)`} on \\`${context.ref}\\` at \\`${context.sha.slice(0, 7)}\\`: ${runUrl}`,\n\
+          \    '',\n    '**Failed steps:** ' + (failedSteps.length ? failedSteps.map((s)\
+          \ => `\\`${s}\\``).join(', ') : 'unknown (see run)'),\n    '',\n    '###\
+          \ Vulnerable dependencies',\n    vulnSection,\n    '',\n    'When clearing\
+          \ an advisory, bump to the latest release with no known advisories, not\
+          \ the first fixed version \u2014 see the note above `IGNORED_VULN_IDS` in\
+          \ `.github/workflows/security-scan.yml`.',\n  ].join('\\n');\n};\n\nlet\
+          \ body = buildBody(findings, 0);\nif (body.length > MAX_BODY) {\n  // Start\
+          \ from the body with no rows (it already carries the\n  // \"not shown\"\
+          \ note) and add rows while they fit. The note only\n  // gets shorter as\
+          \ rows are added. +1 is the joining newline.\n  let used = buildBody([],\
+          \ findings.length).length;\n  let shown = 0;\n  while (shown < findings.length\
+          \ && used + findings[shown].length + 1 <= MAX_BODY) {\n    used += findings[shown].length\
+          \ + 1;\n    shown++;\n  }\n  body = buildBody(findings.slice(0, shown),\
+          \ findings.length - shown);\n}\n// Last resort, e.g. for a very long failed-steps\
+          \ list.\nif (body.length > MAX_BODY) body = body.slice(0, MAX_BODY);\n\n\
+          try {\n  await github.rest.issues.createLabel({ owner, repo, name: label,\
+          \ color: 'b60205' });\n} catch (e) {\n  // 422: the label already exists.\
+          \ Anything else is rethrown:\n  // the tracking issue is found by this label,\
+          \ so nothing below\n  // works without it.\n  if (e.status !== 422) throw\
+          \ e;\n}\n\nconst [existing] = await listOpen();\n\nlet postedTo;\nif (existing)\
+          \ {\n  await github.rest.issues.createComment({\n    owner, repo, issue_number:\
+          \ existing.number, body,\n  });\n  postedTo = existing.number;\n  console.log(`Updated\
+          \ #${existing.number}`);\n} else {\n  const { data: created } = await github.rest.issues.create({\n\
+          \    owner, repo,\n    title: 'Scheduled Security Scan is failing on main',\n\
+          \    labels: [label],\n    body,\n  });\n  postedTo = created.number;\n\
+          \  console.log(`Opened #${created.number}`);\n}\n\n// Two runs that both\
+          \ found no issue can each open one. Keep\n// the lowest-numbered issue and\
+          \ close the rest, so every run\n// converges on the same tracking issue.\
+          \ Runs every time, so\n// duplicates left by earlier runs are closed too.\n\
+          const [keep, ...duplicates] = await listOpen();\nif (keep && keep.number\
+          \ !== postedTo) {\n  await github.rest.issues.createComment({\n    owner,\
+          \ repo, issue_number: keep.number, body,\n  });\n  console.log(`Moved this\
+          \ run's report to #${keep.number}`);\n}\nfor (const duplicate of duplicates)\
+          \ {\n  await github.rest.issues.createComment({\n    owner, repo, issue_number:\
+          \ duplicate.number,\n    body: `Duplicate of #${keep.number}. Closing; scheduled\
+          \ scan failures are tracked there.`,\n  });\n  await github.rest.issues.update({\n\
+          \    owner, repo, issue_number: duplicate.number,\n    state: 'closed',\
+          \ state_reason: 'not_planned',\n  });\n  console.log(`Closed duplicate #${duplicate.number}`);\n\
+          }\n"
+    timeout-minutes: 45
+env:
+  PYTHONPATH: /tmp/instr
+  BASH_ENV: /tmp/instr/bash_env.sh
+'on':
+  schedule:
+  - cron: 30 1 * * *
+  workflow_dispatch: null
+  push:
+    branches:
+    - main
+    paths-ignore:
+    - docs/**
+    - mkdocs.yml
+    - requirements-docs.txt
+    - '**/*.md'
+  pull_request:
+    branches:
+    - main
